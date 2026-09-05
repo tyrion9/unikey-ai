@@ -1,0 +1,8 @@
+# macOS Finder
+.DS_Store
+
+# Build output (regenerate with macos/build.sh / macos/make_dmg.sh;
+# the .dmg is published as a GitHub Release asset instead)
+macos/build/
+macos/UnikeyAI.app
+macos/UnikeyAI.dmg
