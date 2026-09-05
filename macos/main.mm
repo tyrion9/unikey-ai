@@ -17,6 +17,7 @@
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <ServiceManagement/ServiceManagement.h>
+#include <unistd.h> // usleep
 
 extern "C" {
 #include "unikey.h"
@@ -139,22 +140,182 @@ static bool FocusedFieldHasSelection(void) {
     return ok && range.length > 0;
 }
 
+#pragma mark - Accessibility-based correction (Spotlight fallback attempt)
+
+// TryReplaceViaAccessibility bypasses the normal keystroke path entirely,
+// including the FocusedFieldHasSelection fix above - so it must never run
+// against a field that can hold an inline autocomplete suggestion (Chrome's
+// address bar being the known case). Reading kAXValueAttribute there returns
+// the suggestion text glued onto what the user actually typed, and writing
+// a "corrected" value back makes Chrome treat that suggestion as real,
+// committed user text instead of a live, still-editable suggestion - e.g.
+// undoing Telex "w" ("w","w" -> literal "w") landed as the full suggested
+// URL instead of "w". Restrict this path to the one app it was actually
+// built and verified for.
+//
+// Deliberately checked via the PID that owns the focused AX element (the
+// same element TryReplaceViaAccessibility itself is about to read/write),
+// NOT via [NSWorkspace frontmostApplication]: Spotlight's search field is a
+// non-activating overlay panel, so invoking it never makes "Spotlight" the
+// frontmost application - the app that was active before Cmd+Space stays
+// frontmost the whole time. Gating on frontmostApplication therefore never
+// matched, silently forcing every Spotlight correction through the
+// keystroke path and reintroducing the exact timing bug ("ter" -> "teẻ")
+// this function exists to avoid there.
+static bool FocusedElementBelongsToSpotlight(void) {
+    AXUIElementRef systemWide = AXUIElementCreateSystemWide();
+    if (!systemWide) return false;
+
+    CFTypeRef focusedRef = NULL;
+    AXError err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute, &focusedRef);
+    CFRelease(systemWide);
+    if (err != kAXErrorSuccess || !focusedRef) return false;
+    AXUIElementRef focused = (AXUIElementRef)focusedRef;
+
+    pid_t pid = 0;
+    AXError pidErr = AXUIElementGetPid(focused, &pid);
+    CFRelease(focused);
+    if (pidErr != kAXErrorSuccess || pid <= 0) return false;
+
+    NSRunningApplication *app = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    return [app.bundleIdentifier isEqualToString:@"com.apple.Spotlight"];
+}
+
+// Last-resort alternative to synthetic keystrokes: read the focused
+// field's text directly via Accessibility, edit the string ourselves, and
+// write it straight back - no fake Backspace/insert keys at all. Tried
+// after diagnostic logging showed the engine computes the right correction
+// every time, but no synthetic deletion (real Backspace key, or a Unicode
+// Backspace character through the same channel that successfully inserts
+// text) ever takes effect in Spotlight's search field specifically -
+// suggesting Spotlight deliberately ignores synthetic deletion input.
+// This has a real chance of being blocked the same way, but it is a
+// genuinely different mechanism, so it's worth one try.
+//
+// Callers must only reach this when FrontmostAppIsSpotlight() is true (see
+// above) - everywhere else, the proven keystroke-based path must be used.
+//
+// Returns YES if this fully applied the correction (caller must NOT also
+// send synthetic keystrokes - that would double-apply it); NO if anything
+// about the read-modify-write looked uncertain, so the caller should fall
+// back to the proven keystroke-based path used everywhere else.
+static BOOL TryReplaceViaAccessibility(int backspaceCount, const unsigned char *utf8, int len) {
+    AXUIElementRef systemWide = AXUIElementCreateSystemWide();
+    if (!systemWide) return NO;
+
+    CFTypeRef focusedRef = NULL;
+    AXError err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute, &focusedRef);
+    CFRelease(systemWide);
+    if (err != kAXErrorSuccess || !focusedRef) return NO;
+    AXUIElementRef focused = (AXUIElementRef)focusedRef;
+
+    CFTypeRef valueRef = NULL;
+    err = AXUIElementCopyAttributeValue(focused, kAXValueAttribute, &valueRef);
+    if (err != kAXErrorSuccess || !valueRef || CFGetTypeID(valueRef) != CFStringGetTypeID()) {
+        if (valueRef) CFRelease(valueRef);
+        CFRelease(focused);
+        return NO;
+    }
+    NSString *currentValue = (__bridge_transfer NSString *)valueRef;
+
+    CFTypeRef rangeRef = NULL;
+    err = AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute, &rangeRef);
+    CFRange range = {0, 0};
+    BOOL haveRange = (err == kAXErrorSuccess && rangeRef != NULL &&
+                       AXValueGetValue((AXValueRef)rangeRef, (AXValueType)kAXValueCFRangeType, &range));
+    if (rangeRef) CFRelease(rangeRef);
+    if (!haveRange) {
+        CFRelease(focused);
+        return NO;
+    }
+
+    // range.location is the caret (or the start of a selection - e.g.
+    // Chrome's inline autocomplete ghost text; range.length covers that
+    // ghost text). Either way, everything from (caret - backspaceCount) to
+    // (caret + range.length) needs to become the replacement text.
+    NSInteger caret = range.location;
+    if (caret < backspaceCount) {
+        CFRelease(focused);
+        return NO; // less text before the caret than expected - don't guess
+    }
+
+    NSString *replacement = [[NSString alloc] initWithBytes:utf8 length:(NSUInteger)len encoding:NSUTF8StringEncoding];
+    if (len > 0 && replacement.length == 0) {
+        CFRelease(focused);
+        return NO;
+    }
+
+    NSUInteger replaceStart = (NSUInteger)(caret - backspaceCount);
+    NSUInteger replaceLength = (NSUInteger)backspaceCount + range.length;
+    if (replaceStart + replaceLength > currentValue.length) {
+        CFRelease(focused);
+        return NO; // field's reported value doesn't match what we expect - bail out rather than corrupt it
+    }
+
+    NSString *newValue = [currentValue stringByReplacingCharactersInRange:NSMakeRange(replaceStart, replaceLength)
+                                                                 withString:replacement];
+
+    err = AXUIElementSetAttributeValue(focused, kAXValueAttribute, (__bridge CFTypeRef)newValue);
+    if (err != kAXErrorSuccess) {
+        CFRelease(focused);
+        return NO;
+    }
+
+    CFRange newCaretRange = CFRangeMake((CFIndex)(replaceStart + replacement.length), 0);
+    CFTypeRef newRangeValue = AXValueCreate((AXValueType)kAXValueCFRangeType, &newCaretRange);
+    if (newRangeValue) {
+        AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute, newRangeValue);
+        CFRelease(newRangeValue);
+    }
+
+    CFRelease(focused);
+    return YES;
+}
+
 #pragma mark - Synthesizing keystrokes
 
-static void PostBackspaces(int count) {
-    if (count <= 0) return;
+// A handful of system UI surfaces (Spotlight's search field is the known
+// case) seem to drop a synthetic key-down/up pair posted back-to-back with
+// zero time between them - as if a press held for ~0 seconds reads as
+// spurious/bounce noise and gets filtered out, rather than registering as a
+// real backspace. A tiny, human-imperceptible hold time avoids that.
+static const useconds_t kSyntheticKeyHoldMicros = 2000;    // down -> up
+static const useconds_t kBetweenKeystrokeMicros = 4000;    // one key -> the next
+
+// Send one Backspace the same way PostUnicodeUTF8 sends replacement text:
+// as a keycode-0 event carrying a Unicode payload (here, the single
+// character U+0008 BACKSPACE) instead of the real Backspace virtual key
+// (51). We switched to this after the real-keycode version kept getting
+// silently dropped in Spotlight's search field specifically - insertion
+// via this "fake key, real Unicode payload" channel was already proven to
+// work there (that's how the replacement text itself gets typed), so
+// routing the deletion through the same channel sidesteps whatever makes
+// Spotlight ignore a synthetic keycode-51 press.
+static void PostBackspaceChar(void) {
+    UniChar bs = 0x08; // ASCII/Unicode Backspace
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    for (int i = 0; i < count; i++) {
-        CGEventRef down = CGEventCreateKeyboardEvent(src, kBackspaceKeyCode, true);
-        CGEventSetIntegerValueField(down, kCGEventSourceUserData, kSyntheticMarker);
-        CGEventPost(kCGHIDEventTap, down);
-        CFRelease(down);
-        CGEventRef up = CGEventCreateKeyboardEvent(src, kBackspaceKeyCode, false);
-        CGEventSetIntegerValueField(up, kCGEventSourceUserData, kSyntheticMarker);
-        CGEventPost(kCGHIDEventTap, up);
-        CFRelease(up);
-    }
+
+    CGEventRef down = CGEventCreateKeyboardEvent(src, 0, true);
+    CGEventKeyboardSetUnicodeString(down, 1, &bs);
+    CGEventSetIntegerValueField(down, kCGEventSourceUserData, kSyntheticMarker);
+    CGEventPost(kCGHIDEventTap, down);
+    CFRelease(down);
+    usleep(kSyntheticKeyHoldMicros);
+
+    CGEventRef up = CGEventCreateKeyboardEvent(src, 0, false);
+    CGEventKeyboardSetUnicodeString(up, 1, &bs);
+    CGEventSetIntegerValueField(up, kCGEventSourceUserData, kSyntheticMarker);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(up);
+
     if (src) CFRelease(src);
+}
+
+static void PostBackspaces(int count) {
+    for (int i = 0; i < count; i++) {
+        PostBackspaceChar();
+        if (i + 1 < count) usleep(kBetweenKeystrokeMicros);
+    }
 }
 
 // Insert an arbitrary UTF-8 string by posting a "keystroke" whose virtual
@@ -176,6 +337,7 @@ static void PostUnicodeUTF8(const unsigned char *utf8, int len) {
     CGEventSetIntegerValueField(down, kCGEventSourceUserData, kSyntheticMarker);
     CGEventPost(kCGHIDEventTap, down);
     CFRelease(down);
+    usleep(kSyntheticKeyHoldMicros);
 
     CGEventRef up = CGEventCreateKeyboardEvent(src, 0, false);
     CGEventKeyboardSetUnicodeString(up, ulen, buf);
@@ -248,13 +410,40 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
 
     UnikeyFilter((unsigned int)chars[0]);
 
+#if UNIKEYAI_DEBUG_LOG
+    NSLog(@"[UnikeyAI][dbg] key='%c' (0x%02x) -> backspaces=%d bufChars=%d buf=\"%.*s\"",
+          (char)chars[0], chars[0], UnikeyBackspaces, UnikeyBufChars,
+          UnikeyBufChars, (const char *)UnikeyBuf);
+#endif
+
     if (UnikeyBackspaces > 0 || UnikeyBufChars > 0) {
-        int backspaceCount = UnikeyBackspaces;
-        if (backspaceCount > 0 && FocusedFieldHasSelection()) {
-            backspaceCount += 1; // one extra Backspace to consume the inline suggestion (see above)
+        // Only Spotlight needs (and was verified against) the direct
+        // Accessibility read-modify-write below - everywhere else, most
+        // notably Chrome's address bar, it must be skipped so the proven
+        // keystroke path (with its own inline-autocomplete fix) runs instead.
+        BOOL handledViaAX = FocusedElementBelongsToSpotlight() &&
+            TryReplaceViaAccessibility(UnikeyBackspaces, UnikeyBuf, UnikeyBufChars);
+#if UNIKEYAI_DEBUG_LOG
+        NSLog(@"[UnikeyAI][dbg] TryReplaceViaAccessibility -> %@", handledViaAX ? @"YES (handled)" : @"NO (falling back to keystrokes)");
+#endif
+        if (!handledViaAX) {
+            int backspaceCount = UnikeyBackspaces;
+            if (backspaceCount > 0 && FocusedFieldHasSelection()) {
+                backspaceCount += 1; // one extra Backspace to consume the inline suggestion (see above)
+            }
+            PostBackspaces(backspaceCount);
+            // Some system UI (Spotlight's search field is the known case: it
+            // re-runs a live search on every keystroke) can be slow enough
+            // processing the Backspace that our very next event - the
+            // replacement text - arrives before the deletion actually took
+            // effect, so the old letter is left behind and the new one just
+            // gets appended next to it ("ter" -> "teẻ" instead of "tẻ"). A
+            // short pause here gives it time to catch up; imperceptible to a
+            // human typist, and this code path only runs once per syllable
+            // correction, not on every keystroke.
+            usleep(kBetweenKeystrokeMicros);
+            PostUnicodeUTF8(UnikeyBuf, UnikeyBufChars);
         }
-        PostBackspaces(backspaceCount);
-        PostUnicodeUTF8(UnikeyBuf, UnikeyBufChars);
         return NULL; // we replaced this keystroke ourselves; swallow the original
     }
 

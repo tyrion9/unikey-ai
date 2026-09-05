@@ -49,8 +49,11 @@ echo "AR   libukcore.a"
 ar rcs "$BUILD/libukcore.a" "${OBJECTS[@]}"
 
 # --- 2. Compile the macOS front-end and link everything --------------------
-echo "OBJC main.mm"
-clang++ $CXXFLAGS -fobjc-arc $INCLUDES \
+# Set UNIKEYAI_DEBUG_LOG=1 in the environment to build with verbose per-
+# keystroke NSLog output (see main.mm) - useful for diagnosing input issues
+# in tricky fields like Spotlight's; leave unset for normal/release builds.
+echo "OBJC main.mm${UNIKEYAI_DEBUG_LOG:+ (debug logging ON)}"
+clang++ $CXXFLAGS -fobjc-arc $INCLUDES -DUNIKEYAI_DEBUG_LOG=${UNIKEYAI_DEBUG_LOG:-0} \
   -c "$HERE/main.mm" -o "$OBJ/main.o"
 
 echo "LINK UnikeyAI"
