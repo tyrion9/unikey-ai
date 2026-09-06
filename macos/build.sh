@@ -14,7 +14,16 @@ APP="$HERE/UnikeyAI.app"
 rm -rf "$BUILD" "$APP"
 mkdir -p "$OBJ" "$APP/Contents/MacOS"
 
-CXXFLAGS="-std=c++14 -O2 -Wno-c++11-narrowing"
+# -arch arm64 -arch x86_64: build a universal binary so the same .app runs
+# natively on Apple Silicon and Intel Macs.
+# -mmacosx-version-min=13.0: the actual floor this app supports (matches
+# Info.plist's LSMinimumSystemVersion). Without this, clang defaults the
+# deployment target to the build machine's SDK version, silently baking a
+# much higher minimum into the binary (dyld then refuses to launch it on
+# anything older) regardless of what Info.plist claims - always set this
+# explicitly rather than relying on the ambient SDK default.
+DEPLOYMENT_TARGET=13.0
+CXXFLAGS="-std=c++14 -O2 -Wno-c++11-narrowing -arch arm64 -arch x86_64 -mmacosx-version-min=$DEPLOYMENT_TARGET"
 INCLUDES="-I$SRC/byteio -I$SRC/vnconv -I$SRC/ukengine -I$SRC/ukinterface"
 
 # --- 1. Compile the original, unmodified engine sources -------------------
@@ -56,8 +65,8 @@ echo "OBJC main.mm${UNIKEYAI_DEBUG_LOG:+ (debug logging ON)}"
 clang++ $CXXFLAGS -fobjc-arc $INCLUDES -DUNIKEYAI_DEBUG_LOG=${UNIKEYAI_DEBUG_LOG:-0} \
   -c "$HERE/main.mm" -o "$OBJ/main.o"
 
-echo "LINK UnikeyAI"
-clang++ -std=c++14 -fobjc-arc \
+echo "LINK UnikeyAI (arm64 + x86_64)"
+clang++ $CXXFLAGS -fobjc-arc \
   "$OBJ/main.o" "$BUILD/libukcore.a" \
   -framework Cocoa -framework ApplicationServices -framework ServiceManagement \
   -o "$APP/Contents/MacOS/UnikeyAI"
