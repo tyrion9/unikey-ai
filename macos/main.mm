@@ -368,6 +368,24 @@ static CGEventRef EventTapCallback(CGEventTapProxy proxy, CGEventType type, CGEv
         return event;
     }
 
+    if (type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown) {
+        // A click almost always moves the caret/selection to wherever was
+        // clicked - possibly a totally different text field (classic case:
+        // click Chrome's address bar, then click back into the page).
+        // Keyboard-driven focus changes already reset the buffer (Cmd/Ctrl
+        // shortcuts below; Tab/Enter/other control characters are
+        // classified ukcReset by the engine itself and call reset()), but a
+        // mouse click produces no key event at all - without this, the
+        // engine kept building on whatever word it was mid-typing in the
+        // PREVIOUS field. E.g. typing something non-Vietnamese in the
+        // address bar leaves the buffer in a "not Vietnamese" state; that
+        // state doesn't clear on its own, so it silently carried over and
+        // blocked every diacritic in the next field clicked into, until
+        // enough real Backspaces walked the buffer back to empty.
+        UnikeyResetBuf();
+        return event;
+    }
+
     if (type == kCGEventKeyDown && gHotkeyArmed) {
         gHotkeyBroken = YES; // a real keypress while Cmd+Shift are held: not our hotkey
     }
@@ -488,7 +506,12 @@ static NSString *const kShowPanelOnLaunchDefaultsKey = @"UnikeyAI.showPanelOnLau
     // supplies a fallback, it never overwrites a value the user picked.
     [defaults registerDefaults:@{kShowPanelOnLaunchDefaultsKey : @YES}];
 
-    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventFlagsChanged);
+    // Mouse-down events are watched too (though never modified/blocked -
+    // see the early check in EventTapCallback) purely so a click can reset
+    // the engine's word buffer: see the comment there for why this matters.
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventFlagsChanged) |
+        CGEventMaskBit(kCGEventLeftMouseDown) | CGEventMaskBit(kCGEventRightMouseDown) |
+        CGEventMaskBit(kCGEventOtherMouseDown);
     gEventTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                   kCGEventTapOptionDefault, mask,
                                   EventTapCallback, NULL);
