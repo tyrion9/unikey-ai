@@ -47,12 +47,13 @@ Bấm chữ **V/E** trên menu bar để mở bảng điều khiển, hoặc b�
 
 ## Những gì đã thay đổi so với Unikey gốc
 
-Dự án gốc [x-unikey 1.0.4](http://unikey.org) chỉ chạy trên Linux (XIM server + GTK Input Method module). Toàn bộ phần dưới đây là **mới**, nằm trong thư mục [`macos/`](macos/); mã nguồn gốc trong [`src/`](src/) không bị sửa, trừ 1 dòng sửa lỗi biên dịch nêu bên dưới.
+Dự án gốc [x-unikey 1.0.4](http://unikey.org) chỉ chạy trên Linux (XIM server + GTK Input Method module). Toàn bộ phần dưới đây là **mới**, nằm trong thư mục [`macos/`](macos/); thuật toán xử lý tiếng Việt trong [`src/`](src/) (bỏ dấu, nhận diện âm tiết...) giữ **nguyên vẹn** — chỉ 2 thay đổi nhỏ nêu bên dưới, không đụng tới thuật toán.
 
 | Hạng mục | Chi tiết |
 |---|---|
 | **Build cho macOS** | Viết mới `macos/main.mm`: dùng `CGEventTap` (macOS) để bắt phím thay cho XIM/GTK (Linux), gọi thẳng hàm `UnikeyFilter()` gốc — không sửa thuật toán. |
 | **Sửa lỗi biên dịch** | `src/ukengine/mactab.cpp`: 1 dòng `char*` → `const char*` để biên dịch được bằng clang hiện đại (code gốc viết cho gcc cũ trên Linux 2005). |
+| **Bỏ ánh xạ `[`/`]`/`{`/`}` trong Telex** | `src/ukengine/inputproc.cpp` (`TelexMethodMapping`): bản Telex gốc dùng `[`→ơ, `]`→ư (và `{`/`}` cho Ơ/Ư) như một lối tắt thay cho `w`. Bỏ ánh xạ này vì người dùng UnikeyAI gõ dấu ngoặc vuông/nhọn thật (code, markdown...) rất thường xuyên — giờ `[` `]` `{` `}` luôn ra đúng ký tự đó; gõ ơ/ư/ă chỉ còn qua phím `w`. Chỉ áp dụng cho kiểu gõ Telex, không ảnh hưởng thuật toán bỏ dấu. |
 | **Sửa lỗi Chrome address bar** | Phát hiện và loại bỏ vùng gợi ý tự động điền của Chrome (qua Accessibility API) trước khi xoá/gõ lại ký tự có dấu, tránh lỗi nhân đôi chữ (vd "ô" → "oô"). |
 | **Giao diện (GUI)** | Icon trên thanh menu bar (chữ V/E), bảng điều khiển riêng: công tắc bật/tắt, chọn Telex/VNI, khởi động cùng macOS, hiện bảng khi khởi động, nút ẩn giao diện. |
 | **Phím tắt hệ thống** | Tổ hợp **⌘⇧ (Cmd+Shift)** bật/tắt gõ tiếng Việt, nhận diện qua theo dõi trạng thái phím, không xung đột với các phím tắt khác của hệ thống. |

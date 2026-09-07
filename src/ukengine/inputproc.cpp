@@ -109,10 +109,10 @@ DllExport UkKeyMapping TelexMethodMapping[] = {
     {'E', vneRoof_e},
     {'O', vneRoof_o},
     {'D', vneDd},
-    {'[', vneCount + vnl_oh},
-    {']', vneCount + vnl_uh},
-    {'{', vneCount + vnl_Oh},
-    {'}', vneCount + vnl_Uh},
+    // '[' -> ơ, ']' -> ư (and '{' -> Ơ, '}' -> Ư) intentionally removed:
+    // UnikeyAI users type '[' ']' '{' '}' too often as literal brackets
+    // (code, markdown...) for this shortcut to be worth the collision. 'w'
+    // remains the only way to get ơ/ư/ă in Telex.
     {0, vneNormal}
 };
 
